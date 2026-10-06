@@ -1,0 +1,3 @@
+Application Version: 1.0.5
+Build: 105
+Release: 2026.10.07
