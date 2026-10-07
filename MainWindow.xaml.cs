@@ -128,7 +128,7 @@ public partial class MainWindow : Window
         using var dlg = new System.Windows.Forms.OpenFileDialog
         {
             Title = "Select a log file",
-            Filter = "Log files (*.log;*.txt;*.csv)|*.log;*.txt;*.csv|All files (*.*)|*.*",
+            Filter = "Log & Text files (*.log*;*.txt*;*.csv*;TXT_*;LOG_*)|*.log*;*.txt*;*.csv*;TXT_*;LOG_*;*.log;*.txt;*.csv|All files (*.*)|*.*",
             Multiselect = false
         };
 
@@ -136,6 +136,31 @@ public partial class MainWindow : Window
         {
             var path = dlg.FileName;
             LoadPath(path);
+        }
+    }
+
+    private void OnWindowDragOver(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effects = DragDropEffects.Copy;
+        }
+        else
+        {
+            e.Effects = DragDropEffects.None;
+        }
+        e.Handled = true;
+    }
+
+    private void OnWindowDrop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            var files = (string[]?)e.Data.GetData(DataFormats.FileDrop);
+            if (files != null && files.Length > 0)
+            {
+                LoadPath(files[0]);
+            }
         }
     }
 
@@ -264,9 +289,19 @@ public partial class MainWindow : Window
         try
         {
             var files = Directory.EnumerateFiles(folder)
-                .Where(f => f.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ||
-                            f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) ||
-                            f.EndsWith(".csv", StringComparison.OrdinalIgnoreCase));
+                .Where(f =>
+                {
+                    var name = Path.GetFileName(f);
+                    return name.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ||
+                           name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) ||
+                           name.EndsWith(".csv", StringComparison.OrdinalIgnoreCase) ||
+                           name.Contains(".log", StringComparison.OrdinalIgnoreCase) ||
+                           name.Contains(".txt", StringComparison.OrdinalIgnoreCase) ||
+                           name.Contains(".csv", StringComparison.OrdinalIgnoreCase) ||
+                           name.StartsWith("TXT_", StringComparison.OrdinalIgnoreCase) ||
+                           name.StartsWith("LOG_", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderBy(f => f);
 
             foreach (var file in files)
             {
@@ -285,15 +320,32 @@ public partial class MainWindow : Window
         {
             // Use FileShare.ReadWrite to avoid locking issues when log files are being written to by another process
             using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var sr = new StreamReader(fs, Encoding.UTF8);
+            using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
 
             string? line;
+            LogEntry? lastEntry = null;
+
             while ((line = sr.ReadLine()) != null)
             {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
                 var entry = ParseLine(line);
                 if (entry != null)
                 {
                     allEntries.Add(entry);
+                    lastEntry = entry;
+                }
+                else if (lastEntry != null)
+                {
+                    // Multiline continuation (e.g. stack traces, error details, multiline payloads)
+                    lastEntry.Message += Environment.NewLine + line;
+                }
+                else
+                {
+                    // Standalone line without recognized timestamp
+                    var fallback = new LogEntry { Time = "-", Level = "INF", Message = line.Trim(), RawLine = line };
+                    allEntries.Add(fallback);
+                    lastEntry = fallback;
                 }
             }
         }
@@ -303,35 +355,112 @@ public partial class MainWindow : Window
         }
     }
 
+    // Regex patterns for comprehensive log parsing
+    private static readonly Regex TimeStartPattern = new(
+        @"^(?:\[|\()?(?<time>\d{4}[-/.]\d{2}[-/.]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\d{2}[-/.]\d{2}[-/.]\d{4}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:\]|\))?\s*(?:[-|:]\s*)?(?<rest>.*)$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex LevelStartPattern = new(
+        @"^(?:\[(?<level>[A-Za-z]+)\]|(?<level>[A-Za-z]{3,12}))\s*(?:[-|:]\s*)?(?<time>\d{4}[-/.]\d{2}[-/.]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|\d{2}[-/.]\d{2}[-/.]\d{4}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*(?:[-|:]\s*)?(?<rest>.*)$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex CsvLogPattern = new(
+        @"^[""']?(?<time>\d{4}[-/.]\d{2}[-/.]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|\d{2}[-/.]\d{2}[-/.]\d{4}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)[""']?[\t,;]\s*[""']?(?<level>[A-Za-z]+)[""']?[\t,;]\s*[""']?(?<msg>.*?)[""']?$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex EmbeddedLevelPattern = new(
+        @"(?:^|[\s\[\(\|,-])(?<level>CRITICAL|FATAL|EMERGENCY|ALERT|PANIC|CRT|CRIT|FTL|ERROR|SEVERE|EXCEPTION|ERRO|ERR|SEV|WARNING|WARN|WRN|INFORMATION|INFORMATIVE|NOTICE|INFO|INF|DEBUG|DEBG|FINEST|FINER|FINE|DBG|TRACE|VERBOSE|TRAC|VRB|TRC)(?:[\s\]\)\:,-]|$)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static string NormalizeLevel(string rawLevel)
+    {
+        if (string.IsNullOrWhiteSpace(rawLevel)) return "INF";
+        var upper = rawLevel.Trim().ToUpperInvariant();
+        return upper switch
+        {
+            "CRITICAL" or "CRIT" or "CRT" or "FATAL" or "FTL" or "EMERGENCY" or "ALERT" or "PANIC" => "CRT",
+            "ERROR" or "ERR" or "ERRO" or "SEVERE" or "EXCEPTION" or "SEV" => "ERR",
+            "WARNING" or "WARN" or "WRN" => "WRN",
+            "INFORMATION" or "INFO" or "INF" or "INFORMATIVE" or "NOTICE" => "INF",
+            "DEBUG" or "DBG" or "DEBG" or "FINE" or "FINER" or "FINEST" => "DBG",
+            "TRACE" or "TRC" or "TRAC" or "VERBOSE" or "VRB" => "TRC",
+            _ => upper.Length >= 3 ? upper.Substring(0, 3) : upper
+        };
+    }
+
     private LogEntry? ParseLine(string line)
     {
         if (string.IsNullOrWhiteSpace(line)) return null;
 
-        var bracketStart = line.IndexOf('[');
-        var bracketEnd = line.IndexOf(']', Math.Max(0, bracketStart));
-
-        if (bracketStart >= 0 && bracketEnd > bracketStart)
+        // 1. Check CSV / TSV format
+        var csvMatch = CsvLogPattern.Match(line);
+        if (csvMatch.Success)
         {
-            var tsStr = line.Substring(0, bracketStart).Trim();
-            var rawLevel = line.Substring(bracketStart + 1, bracketEnd - bracketStart - 1).Trim().ToUpper();
-            var msg = line.Substring(bracketEnd + 1).Trim();
-
-            var level = rawLevel switch
-            {
-                "ERROR" or "ERR" => "ERR",
-                "WARNING" or "WARN" or "WRN" => "WRN",
-                "INFO" or "INFORMATION" or "INF" => "INF",
-                "DEBUG" or "DBG" => "DBG",
-                "TRACE" or "TRC" => "TRC",
-                "CRITICAL" or "FATAL" or "CRT" => "CRT",
-                _ => rawLevel.Length >= 3 ? rawLevel.Substring(0, 3) : rawLevel
-            };
-
-            return new LogEntry { Time = string.IsNullOrEmpty(tsStr) ? "-" : tsStr, Level = level, Message = msg };
+            var ts = csvMatch.Groups["time"].Value.Trim();
+            var lvl = NormalizeLevel(csvMatch.Groups["level"].Value);
+            var msg = csvMatch.Groups["msg"].Value.Trim();
+            return new LogEntry { Time = ts, Level = lvl, Message = msg, RawLine = line };
         }
 
-        var parts = line.Split(new[] { ' ' }, 2);
-        return new LogEntry { Time = parts[0], Level = "INF", Message = parts.Length > 1 ? parts[1] : line };
+        // 2. Check Level at start format (e.g. [INFO] 2026-09-29 13:52:56,856 msg)
+        var levelStartMatch = LevelStartPattern.Match(line);
+        if (levelStartMatch.Success)
+        {
+            var lvl = NormalizeLevel(levelStartMatch.Groups["level"].Value);
+            var ts = levelStartMatch.Groups["time"].Value.Trim();
+            var msg = CleanMessage(levelStartMatch.Groups["rest"].Value);
+            return new LogEntry { Time = ts, Level = lvl, Message = msg, RawLine = line };
+        }
+
+        // 3. Check Timestamp at start format (e.g. 2026-09-29 13:52:56,856 RZHPWIN001 INFO msg)
+        var timeMatch = TimeStartPattern.Match(line);
+        if (timeMatch.Success)
+        {
+            var ts = timeMatch.Groups["time"].Value.Trim();
+            var rest = timeMatch.Groups["rest"].Value.Trim();
+
+            // Locate level word anywhere in header portion of rest
+            var lvlMatch = EmbeddedLevelPattern.Match(rest);
+            if (lvlMatch.Success)
+            {
+                var lvl = NormalizeLevel(lvlMatch.Groups["level"].Value);
+                var prefix = rest.Substring(0, lvlMatch.Index).Trim();
+                if (prefix == "-" || prefix == "|" || prefix == ":") prefix = "";
+
+                var suffix = rest.Substring(lvlMatch.Index + lvlMatch.Length).Trim();
+                suffix = CleanMessage(suffix);
+
+                string msg;
+                if (!string.IsNullOrEmpty(prefix))
+                {
+                    msg = $"{prefix}  {suffix}";
+                }
+                else
+                {
+                    msg = suffix;
+                }
+
+                return new LogEntry { Time = ts, Level = lvl, Message = msg, RawLine = line };
+            }
+
+            // Timestamp matched, but no specific level keyword found -> default to INF
+            return new LogEntry { Time = ts, Level = "INF", Message = CleanMessage(rest), RawLine = line };
+        }
+
+        // 4. Line does not have a timestamp at the start -> return null to allow multiline / continuation handling
+        return null;
+    }
+
+    private static string CleanMessage(string msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg)) return "";
+        var trimmed = msg.Trim();
+        // Strip common leading delimiters like "- ", ": ", "| "
+        if (trimmed.StartsWith("- ") || trimmed.StartsWith(": ") || trimmed.StartsWith("| "))
+        {
+            trimmed = trimmed.Substring(2).TrimStart();
+        }
+        return trimmed;
     }
 
     private void LogGrid_LoadingRow(object sender, DataGridRowEventArgs e)
@@ -413,6 +542,22 @@ public partial class MainWindow : Window
         ApplyFilter();
     }
 
+    private static bool MatchesLevelSearch(string normalizedLevel, string query)
+    {
+        if (string.IsNullOrWhiteSpace(query)) return false;
+        var q = query.Trim().ToUpperInvariant();
+        return normalizedLevel switch
+        {
+            "INF" => q is "INF" or "INFO" or "INFORMATION" or "NOTICE",
+            "ERR" => q is "ERR" or "ERROR" or "SEVERE" or "EXCEPTION" or "SEV",
+            "WRN" => q is "WRN" or "WARN" or "WARNING",
+            "CRT" => q is "CRT" or "CRIT" or "CRITICAL" or "FATAL" or "FTL",
+            "DBG" => q is "DBG" or "DEBUG" or "FINE" or "DEBG",
+            "TRC" => q is "TRC" or "TRACE" or "VERBOSE" or "VRB",
+            _ => normalizedLevel.Equals(q, StringComparison.OrdinalIgnoreCase)
+        };
+    }
+
     private void ApplyFilter()
     {
         var searchText = FilterText.Text?.Trim() ?? "";
@@ -455,7 +600,8 @@ public partial class MainWindow : Window
 
             return x.Message.Contains(searchText, comparison) ||
                    x.Time.Contains(searchText, comparison) ||
-                   x.Level.Contains(searchText, comparison);
+                   x.Level.Contains(searchText, comparison) ||
+                   MatchesLevelSearch(x.Level, searchText);
         }).ToList();
 
         LogGrid.ItemsSource = filtered;
@@ -604,4 +750,5 @@ public class LogEntry
     public string Time { get; set; } = "";
     public string Level { get; set; } = "";
     public string Message { get; set; } = "";
+    public string RawLine { get; set; } = "";
 }

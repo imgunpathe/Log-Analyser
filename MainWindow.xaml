@@ -8,6 +8,7 @@
         Background="{DynamicResource WindowBgBrush}"
         Foreground="{DynamicResource TextPrimaryBrush}"
         WindowStartupLocation="CenterScreen"
+        AllowDrop="True" Drop="OnWindowDrop" DragOver="OnWindowDragOver"
         FontFamily="Segoe UI, Inter, System-UI" FontSize="13">
 
   <Window.Resources>
